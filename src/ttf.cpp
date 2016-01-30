@@ -6,11 +6,64 @@
 // Copyright 2008-2013 Jonathan Westhues.
 //-----------------------------------------------------------------------------
 #include "solvespace.h"
+#include <sys/stat.h>
+
+/* Yecch. Irritatingly, you need to do this nonsense to get the error string table, since nobody thought to put this exact function into FreeType itsself. */
+#include <ft2build.h>
+/* concatenate C tokens */
+#define FT_ERR_XCAT( x, y )  x ## y
+#define FT_ERR_CAT( x, y )   FT_ERR_XCAT( x, y )
+#define FT_ERR( e )  FT_ERR_CAT( FT_ERR_PREFIX, e )
+#include FT_ERRORS_H
+
+#undef __FTERRORS_H__
+#define FT_ERRORDEF(e, v, s) { (e), (s) },
+#define FT_ERROR_START_LIST
+#define FT_ERROR_END_LIST { 0, NULL }
+
+struct ft_error
+{
+	int err;
+	char *str;
+};
+
+static const struct ft_error ft_errors[] =
+{
+#include FT_ERRORS_H
+};
+
+extern "C" char *ft_error_string(int err)
+{
+	const struct ft_error *e;
+	for (e = ft_errors; e->str; e++)
+		if (e->err == err)
+			return e->str;
+	return "Unknown error";
+}
+
+/* Okay, now that we're done with that, grab the rest of the headers. */
+#undef FT_ERR
+#undef FT_ERR_CAT
+#undef FT_ERR_XCAT
+#undef FT_ERRORDEF
+#undef FT_ERROR_START_LIST
+#undef FT_ERROR_END_LIST
+#include FT_FREETYPE_H
+#include FT_OUTLINE_H
+#include FT_ADVANCES_H
 
 //-----------------------------------------------------------------------------
 // Get the list of available font filenames, and load the name for each of
 // them. Only that, though, not the glyphs too.
 //-----------------------------------------------------------------------------
+TtfFont::TtfFont(void) {
+    FT_Init_FreeType(&ftlib);
+}
+
+TtfFont::~TtfFont() {
+    FT_Done_FreeType(ftlib);
+}
+
 void TtfFontList::LoadAll(void) {
     if(loaded) return;
 
@@ -26,8 +79,7 @@ void TtfFontList::LoadAll(void) {
     loaded = true;
 }
 
-void TtfFontList::PlotString(const std::string &font, const char *str, double spacing,
-                             SBezierList *sbl,
+void TtfFontList::PlotString(const std::string &font, const char *str, float spacing, SBezierList *sbl,
                              Vector origin, Vector u, Vector v)
 {
     LoadAll();
@@ -50,184 +102,6 @@ void TtfFontList::PlotString(const std::string &font, const char *str, double sp
     sbl->l.Add(&sb);
 }
 
-
-//=============================================================================
-
-//-----------------------------------------------------------------------------
-// Get a single character from the open .ttf file; EOF is an error, since
-// we can always see that coming.
-//-----------------------------------------------------------------------------
-int TtfFont::Getc(void) {
-    int c = fgetc(fh);
-    if(c == EOF) {
-        throw "EOF";
-    }
-    return c;
-}
-
-//-----------------------------------------------------------------------------
-// Helpers to get 1, 2, or 4 bytes from the .ttf file. Big endian.
-// The BYTE, USHORT and ULONG nomenclature comes from the OpenType spec.
-//-----------------------------------------------------------------------------
-uint8_t TtfFont::GetBYTE(void) {
-    return (uint8_t)Getc();
-}
-uint16_t TtfFont::GetUSHORT(void) {
-    uint8_t b0, b1;
-    b1 = (uint8_t)Getc();
-    b0 = (uint8_t)Getc();
-
-    return (uint16_t)(b1 << 8) | b0;
-}
-uint32_t TtfFont::GetULONG(void) {
-    uint8_t b0, b1, b2, b3;
-    b3 = (uint8_t)Getc();
-    b2 = (uint8_t)Getc();
-    b1 = (uint8_t)Getc();
-    b0 = (uint8_t)Getc();
-
-    return
-        (uint32_t)(b3 << 24) |
-        (uint32_t)(b2 << 16) |
-        (uint32_t)(b1 <<  8) |
-        b0;
-}
-
-//-----------------------------------------------------------------------------
-// Load a glyph from the .ttf file into memory. Assumes that the .ttf file
-// is already seeked to the correct location, and writes the result to
-// glyphs[index]
-//-----------------------------------------------------------------------------
-void TtfFont::LoadGlyph(int index) {
-    if(index < 0 || index >= glyph.size()) return;
-
-    int i;
-
-    int16_t contours        = (int16_t)GetUSHORT();
-    int16_t xMin            = (int16_t)GetUSHORT();
-    int16_t yMin            = (int16_t)GetUSHORT();
-    int16_t xMax            = (int16_t)GetUSHORT();
-    int16_t yMax            = (int16_t)GetUSHORT();
-
-    if(charMap.size() > 'A' && charMap[(int)'A'] == index) {
-        if(yMax > 0) {
-            scale = (1024*1024) / yMax;
-        } else {
-            scale = 1;
-        }
-    }
-
-    if(contours > 0) {
-        uint16_t *endPointsOfContours =
-            (uint16_t *)AllocTemporary(contours*sizeof(uint16_t));
-
-        for(i = 0; i < contours; i++) {
-            endPointsOfContours[i] = GetUSHORT();
-        }
-        uint16_t totalPts = endPointsOfContours[i-1] + 1;
-
-        uint16_t instructionLength = GetUSHORT();
-        for(i = 0; i < instructionLength; i++) {
-            // We can ignore the instructions, since we're doing vector
-            // output.
-            (void)GetBYTE();
-        }
-
-        uint8_t *flags = (uint8_t *)AllocTemporary(totalPts*sizeof(uint8_t));
-        int16_t *x     = (int16_t *)AllocTemporary(totalPts*sizeof(int16_t));
-        int16_t *y     = (int16_t *)AllocTemporary(totalPts*sizeof(int16_t));
-
-        // Flags, that indicate format of the coordinates
-#define FLAG_ON_CURVE           (1 << 0)
-#define FLAG_DX_IS_BYTE         (1 << 1)
-#define FLAG_DY_IS_BYTE         (1 << 2)
-#define FLAG_REPEAT             (1 << 3)
-#define FLAG_X_IS_SAME          (1 << 4)
-#define FLAG_X_IS_POSITIVE      (1 << 4)
-#define FLAG_Y_IS_SAME          (1 << 5)
-#define FLAG_Y_IS_POSITIVE      (1 << 5)
-        for(i = 0; i < totalPts; i++) {
-            flags[i] = GetBYTE();
-            if(flags[i] & FLAG_REPEAT) {
-                int n = GetBYTE();
-                uint8_t f = flags[i];
-                int j;
-                for(j = 0; j < n; j++) {
-                    i++;
-                    if(i >= totalPts) {
-                        throw "too many points in glyph";
-                    }
-                    flags[i] = f;
-                }
-            }
-        }
-
-        // x coordinates
-        int16_t xa = 0;
-        for(i = 0; i < totalPts; i++) {
-            if(flags[i] & FLAG_DX_IS_BYTE) {
-                uint8_t v = GetBYTE();
-                if(flags[i] & FLAG_X_IS_POSITIVE) {
-                    xa += v;
-                } else {
-                    xa -= v;
-                }
-            } else {
-                if(flags[i] & FLAG_X_IS_SAME) {
-                    // no change
-                } else {
-                    int16_t d = (int16_t)GetUSHORT();
-                    xa += d;
-                }
-            }
-            x[i] = xa;
-        }
-
-        // y coordinates
-        int16_t ya = 0;
-        for(i = 0; i < totalPts; i++) {
-            if(flags[i] & FLAG_DY_IS_BYTE) {
-                uint8_t v = GetBYTE();
-                if(flags[i] & FLAG_Y_IS_POSITIVE) {
-                    ya += v;
-                } else {
-                    ya -= v;
-                }
-            } else {
-                if(flags[i] & FLAG_Y_IS_SAME) {
-                    // no change
-                } else {
-                    int16_t d = (int16_t)GetUSHORT();
-                    ya += d;
-                }
-            }
-            y[i] = ya;
-        }
-
-        Glyph *g = &(glyph[index]);
-        g->pt = (FontPoint *)MemAlloc(totalPts*sizeof(FontPoint));
-        int contour = 0;
-        for(i = 0; i < totalPts; i++) {
-            g->pt[i].x = x[i];
-            g->pt[i].y = y[i];
-            g->pt[i].onCurve = (uint8_t)(flags[i] & FLAG_ON_CURVE);
-
-            if(i == endPointsOfContours[contour]) {
-                g->pt[i].lastInContour = true;
-                contour++;
-            } else {
-                g->pt[i].lastInContour = false;
-            }
-        }
-        g->pts = totalPts;
-        g->xMax = xMax;
-        g->xMin = xMin;
-
-    } else {
-        // This is a composite glyph, TODO.
-    }
-}
-
 //-----------------------------------------------------------------------------
 // Return the basename of our font filename; that's how the requests and
 // entities that reference us will store it.
@@ -248,334 +122,41 @@ std::string TtfFont::FontFileBaseName(void) {
 bool TtfFont::LoadFontFromFile(bool nameOnly) {
     if(loaded) return true;
 
-    int i;
+    FILE   *fh;
+    struct stat st;
+    int fterr;
 
+    stat(fontFile.c_str(), &st);
     fh = ssfopen(fontFile, "rb");
     if(!fh) {
         return false;
     }
+    fontdata = (unsigned char*)malloc(st.st_size+1);
+    fontdatalen = st.st_size;
+    fread(fontdata, 1, fontdatalen, fh);
+    fclose(fh);
 
-    try {
-        // First, load the Offset Table
-        uint32_t   version         = GetULONG();
-        uint16_t   numTables       = GetUSHORT();
-        uint16_t   searchRange     = GetUSHORT();
-        uint16_t   entrySelector   = GetUSHORT();
-        uint16_t   rangeShift      = GetUSHORT();
-
-        // Now load the Table Directory; our goal in doing this will be to
-        // find the addresses of the tables that we will need.
-        uint32_t   glyfAddr = (uint32_t)-1, glyfLen;
-        uint32_t   cmapAddr = (uint32_t)-1, cmapLen;
-        uint32_t   headAddr = (uint32_t)-1, headLen;
-        uint32_t   locaAddr = (uint32_t)-1, locaLen;
-        uint32_t   maxpAddr = (uint32_t)-1, maxpLen;
-        uint32_t   nameAddr = (uint32_t)-1, nameLen;
-        uint32_t   hmtxAddr = (uint32_t)-1, hmtxLen;
-        uint32_t   hheaAddr = (uint32_t)-1, hheaLen;
-
-        for(i = 0; i < numTables; i++) {
-            char tag[5] = "xxxx";
-            tag[0]              = (char)GetBYTE();
-            tag[1]              = (char)GetBYTE();
-            tag[2]              = (char)GetBYTE();
-            tag[3]              = (char)GetBYTE();
-            uint32_t  checksum  = GetULONG();
-            uint32_t  offset    = GetULONG();
-            uint32_t  length    = GetULONG();
-
-            if(strcmp(tag, "glyf")==0) {
-                glyfAddr = offset;
-                glyfLen = length;
-            } else if(strcmp(tag, "cmap")==0) {
-                cmapAddr = offset;
-                cmapLen = length;
-            } else if(strcmp(tag, "head")==0) {
-                headAddr = offset;
-                headLen = length;
-            } else if(strcmp(tag, "loca")==0) {
-                locaAddr = offset;
-                locaLen = length;
-            } else if(strcmp(tag, "maxp")==0) {
-                maxpAddr = offset;
-                maxpLen = length;
-            } else if(strcmp(tag, "name")==0) {
-                nameAddr = offset;
-                nameLen = length;
-            } else if(strcmp(tag, "hhea")==0) {
-                hheaAddr = offset;
-                hheaLen = length;
-            } else if(strcmp(tag, "hmtx")==0) {
-                hmtxAddr = offset;
-                hmtxLen = length;
-            }
-        }
-
-        if(glyfAddr == (uint32_t)-1 ||
-           cmapAddr == (uint32_t)-1 ||
-           headAddr == (uint32_t)-1 ||
-           locaAddr == (uint32_t)-1 ||
-           maxpAddr == (uint32_t)-1 ||
-           hmtxAddr == (uint32_t)-1 ||
-           nameAddr == (uint32_t)-1 ||
-           hheaAddr == (uint32_t)-1)
-        {
-            throw "missing table addr";
-        }
-
-        // Load the name table. This gives us display names for the font, which
-        // we need when we're giving the user a list to choose from.
-        fseek(fh, nameAddr, SEEK_SET);
-
-        uint16_t  nameFormat        = GetUSHORT();
-        uint16_t  nameCount         = GetUSHORT();
-        uint16_t  nameStringOffset  = GetUSHORT();
-        // And now we're at the name records. Go through those till we find
-        // one that we want.
-        int displayNameOffset = 0, displayNameLength = 0;
-        for(i = 0; i < nameCount; i++) {
-            uint16_t  platformID    = GetUSHORT();
-            uint16_t  encodingID    = GetUSHORT();
-            uint16_t  languageID    = GetUSHORT();
-            uint16_t  nameId        = GetUSHORT();
-            uint16_t  length        = GetUSHORT();
-            uint16_t  offset        = GetUSHORT();
-
-            if(nameId == 4) {
-                displayNameOffset = offset;
-                displayNameLength = length;
-                break;
-            }
-        }
-        if(nameOnly && i >= nameCount) {
-            throw "no name";
-        }
-
-        if(nameOnly) {
-            // Find the display name, and store it in the provided buffer.
-            fseek(fh, nameAddr+nameStringOffset+displayNameOffset, SEEK_SET);
-            name.clear();
-            for(i = 0; i < displayNameLength; i++) {
-                char b = (char)GetBYTE();
-                if(b) name += b;
-            }
-
-            fclose(fh);
-            return true;
-        }
-
-
-        // Load the head table; we need this to determine the format of the
-        // loca table, 16- or 32-bit entries
-        fseek(fh, headAddr, SEEK_SET);
-
-        uint32_t headVersion           = GetULONG();
-        uint32_t headFontRevision      = GetULONG();
-        uint32_t headCheckSumAdj       = GetULONG();
-        uint32_t headMagicNumber       = GetULONG();
-        uint16_t headFlags             = GetUSHORT();
-        uint16_t headUnitsPerEm        = GetUSHORT();
-        (void)GetULONG(); // created time
-        (void)GetULONG();
-        (void)GetULONG(); // modified time
-        (void)GetULONG();
-        uint16_t headXmin              = GetUSHORT();
-        uint16_t headYmin              = GetUSHORT();
-        uint16_t headXmax              = GetUSHORT();
-        uint16_t headYmax              = GetUSHORT();
-        uint16_t headMacStyle          = GetUSHORT();
-        uint16_t headLowestRecPPEM     = GetUSHORT();
-        uint16_t headFontDirectionHint = GetUSHORT();
-        uint16_t headIndexToLocFormat  = GetUSHORT();
-        uint16_t headGlyphDataFormat   = GetUSHORT();
-
-        if(headMagicNumber != 0x5F0F3CF5) {
-            throw "bad magic number";
-        }
-
-        // Load the hhea table, which contains the number of entries in the
-        // horizontal metrics (hmtx) table.
-        fseek(fh, hheaAddr, SEEK_SET);
-        uint32_t hheaVersion           = GetULONG();
-        uint16_t hheaAscender          = GetUSHORT();
-        uint16_t hheaDescender         = GetUSHORT();
-        uint16_t hheaLineGap           = GetUSHORT();
-        uint16_t hheaAdvanceWidthMax   = GetUSHORT();
-        uint16_t hheaMinLsb            = GetUSHORT();
-        uint16_t hheaMinRsb            = GetUSHORT();
-        uint16_t hheaXMaxExtent        = GetUSHORT();
-        uint16_t hheaCaretSlopeRise    = GetUSHORT();
-        uint16_t hheaCaretSlopeRun     = GetUSHORT();
-        uint16_t hheaCaretOffset       = GetUSHORT();
-        (void)GetUSHORT();
-        (void)GetUSHORT();
-        (void)GetUSHORT();
-        (void)GetUSHORT();
-        uint16_t hheaMetricDataFormat  = GetUSHORT();
-        uint16_t hheaNumberOfMetrics   = GetUSHORT();
-
-        // Load the maxp table, which determines (among other things) the number
-        // of glyphs in the font
-        fseek(fh, maxpAddr, SEEK_SET);
-
-        uint32_t maxpVersion               = GetULONG();
-        uint16_t maxpNumGlyphs             = GetUSHORT();
-        uint16_t maxpMaxPoints             = GetUSHORT();
-        uint16_t maxpMaxContours           = GetUSHORT();
-        uint16_t maxpMaxComponentPoints    = GetUSHORT();
-        uint16_t maxpMaxComponentContours  = GetUSHORT();
-        uint16_t maxpMaxZones              = GetUSHORT();
-        uint16_t maxpMaxTwilightPoints     = GetUSHORT();
-        uint16_t maxpMaxStorage            = GetUSHORT();
-        uint16_t maxpMaxFunctionDefs       = GetUSHORT();
-        uint16_t maxpMaxInstructionDefs    = GetUSHORT();
-        uint16_t maxpMaxStackElements      = GetUSHORT();
-        uint16_t maxpMaxSizeOfInstructions = GetUSHORT();
-        uint16_t maxpMaxComponentElements  = GetUSHORT();
-        uint16_t maxpMaxComponentDepth     = GetUSHORT();
-
-        glyph.resize(maxpNumGlyphs);
-
-        // Load the hmtx table, which gives the horizontal metrics (spacing
-        // and advance width) of the font.
-        fseek(fh, hmtxAddr, SEEK_SET);
-
-        uint16_t hmtxAdvanceWidth = 0;
-        int16_t  hmtxLsb = 0;
-        for(i = 0; i < min(glyph.size(), (size_t)hheaNumberOfMetrics); i++) {
-            hmtxAdvanceWidth = GetUSHORT();
-            hmtxLsb          = (int16_t)GetUSHORT();
-
-            glyph[i].leftSideBearing = hmtxLsb;
-            glyph[i].advanceWidth = hmtxAdvanceWidth;
-        }
-        // The last entry in the table applies to all subsequent glyphs also.
-        for(; i < glyph.size(); i++) {
-            glyph[i].leftSideBearing = hmtxLsb;
-            glyph[i].advanceWidth = hmtxAdvanceWidth;
-        }
-
-        // Load the cmap table, which determines the mapping of characters to
-        // glyphs.
-        fseek(fh, cmapAddr, SEEK_SET);
-
-        uint32_t usedTableAddr = (uint32_t)-1;
-
-        uint16_t cmapVersion    = GetUSHORT();
-        uint16_t cmapTableCount = GetUSHORT();
-        for(i = 0; i < cmapTableCount; i++) {
-            uint16_t platformId = GetUSHORT();
-            uint16_t encodingId = GetUSHORT();
-            uint32_t offset     = GetULONG();
-
-            if(platformId == 3 && encodingId == 1) {
-                // The Windows Unicode mapping is our preference
-                usedTableAddr = cmapAddr + offset;
-            }
-        }
-
-        if(usedTableAddr == (uint32_t)-1) {
-            throw "no used table addr";
-        }
-
-        // So we can load the desired subtable; in this case, Windows Unicode,
-        // which is us.
-        fseek(fh, usedTableAddr, SEEK_SET);
-
-        uint16_t mapFormat          = GetUSHORT();
-        uint16_t mapLength          = GetUSHORT();
-        uint16_t mapVersion         = GetUSHORT();
-        uint16_t mapSegCountX2      = GetUSHORT();
-        uint16_t mapSearchRange     = GetUSHORT();
-        uint16_t mapEntrySelector   = GetUSHORT();
-        uint16_t mapRangeShift      = GetUSHORT();
-
-        if(mapFormat != 4) {
-            // Required to use format 4 per spec
-            throw "not format 4";
-        }
-
-        int segCount = mapSegCountX2 / 2;
-        uint16_t *endChar       = (uint16_t *)AllocTemporary(segCount*sizeof(uint16_t));
-        uint16_t *startChar     = (uint16_t *)AllocTemporary(segCount*sizeof(uint16_t));
-        uint16_t *idDelta       = (uint16_t *)AllocTemporary(segCount*sizeof(uint16_t));
-        uint16_t *idRangeOffset = (uint16_t *)AllocTemporary(segCount*sizeof(uint16_t));
-
-        uint32_t *filePos = (uint32_t *)AllocTemporary(segCount*sizeof(uint32_t));
-
-        for(i = 0; i < segCount; i++) {
-            endChar[i] = GetUSHORT();
-        }
-        uint16_t mapReservedPad = GetUSHORT();
-        for(i = 0; i < segCount; i++) {
-            startChar[i] = GetUSHORT();
-        }
-        for(i = 0; i < segCount; i++) {
-            idDelta[i] = GetUSHORT();
-        }
-        for(i = 0; i < segCount; i++) {
-            filePos[i] = (uint32_t)ftell(fh);
-            idRangeOffset[i] = GetUSHORT();
-        }
-
-        for(i = 0; i < segCount; i++) {
-            if(charMap.size() < endChar[i] + 1)
-                charMap.resize(endChar[i] + 1);
-
-            uint16_t v = idDelta[i];
-            if(idRangeOffset[i] == 0) {
-                for(int j = startChar[i]; j <= endChar[i]; j++) {
-                    // Arithmetic is modulo 2^16
-                    charMap[j] = (uint16_t)(j + v);
-                }
-            } else {
-                for(int j = startChar[i]; j <= endChar[i]; j++) {
-                    int fp = filePos[i];
-                    fp += (j - startChar[i])*sizeof(uint16_t);
-                    fp += idRangeOffset[i];
-                    fseek(fh, fp, SEEK_SET);
-
-                    charMap[j] = GetUSHORT();
-                }
-            }
-        }
-
-        // Load the loca table. This contains the offsets of each glyph,
-        // relative to the beginning of the glyf table.
-        fseek(fh, locaAddr, SEEK_SET);
-
-        uint32_t *glyphOffsets = (uint32_t *)AllocTemporary(glyph.size()*sizeof(uint32_t));
-
-        for(i = 0; i < glyph.size(); i++) {
-            if(headIndexToLocFormat == 1) {
-                // long offsets, 32 bits
-                glyphOffsets[i] = GetULONG();
-            } else if(headIndexToLocFormat == 0) {
-                // short offsets, 16 bits but divided by 2
-                glyphOffsets[i] = GetUSHORT()*2;
-            } else {
-                throw "bad headIndexToLocFormat";
-            }
-        }
-
-        scale = 1024;
-        // Load the glyf table. This contains the actual representations of the
-        // letter forms, as piecewise linear or quadratic outlines.
-        for(i = 0; i < glyph.size(); i++) {
-            fseek(fh, glyfAddr + glyphOffsets[i], SEEK_SET);
-            LoadGlyph(i);
-        }
-    } catch (const char *s) {
-        dbp("ttf: file %s failed: '%s'", fontFile.c_str(), s);
-        fclose(fh);
+    if ((fterr = FT_New_Memory_Face(ftlib, fontdata, fontdatalen, 0, &font_face)) != 0) {
+        dbp("ttf: file %s failed: '%s'", fontFile.c_str(), ft_error_string(fterr));
+        free(fontdata);
         return false;
     }
 
-    fclose(fh);
+    if (nameOnly) {
+        name = string(font_face->family_name);
+        FT_Done_Face(font_face);
+        free(fontdata);
+        return true;
+    }
+
+    if ((fterr = FT_Select_Charmap(font_face, FT_ENCODING_UNICODE)) != 0) {
+        dbp("loading unicode CMap failed: %s", ft_error_string(fterr));
+    }
     loaded = true;
     return true;
 }
 
+#if 0
 void TtfFont::Flush(void) {
     lastWas = NOTHING;
 }
@@ -593,19 +174,17 @@ void TtfFont::Handle(int *dx, int x, int y, bool onCurve) {
     } else if(lastWas == OFF_CURVE && onCurve) {
         // We are ready to do a Bezier.
         Bezier(lastOnCurve.x, lastOnCurve.y,
-               lastOffCurve.x, lastOffCurve.y,
-               x, y);
+               lastOffCurve.x, lastOffCurve.y, x, y);
     } else if(lastWas == OFF_CURVE && !onCurve) {
         // Two consecutive off-curve points implicitly have an on-point
         // curve between them, and that should trigger us to generate a
         // Bezier.
         IntPoint fake;
-        fake.x = (x + lastOffCurve.x) / 2;
-        fake.y = (y + lastOffCurve.y) / 2;
+        fake.x = (x + p->x) / 2;
+        fake.y = (y + p->y) / 2;
         Bezier(lastOnCurve.x, lastOnCurve.y,
                lastOffCurve.x, lastOffCurve.y,
                fake.x, fake.y);
-
         lastOnCurve.x = fake.x;
         lastOnCurve.y = fake.y;
     }
@@ -620,53 +199,126 @@ void TtfFont::Handle(int *dx, int x, int y, bool onCurve) {
         lastWas = OFF_CURVE;
     }
 }
+#endif
 
-void TtfFont::PlotCharacter(int *dx, char32_t c, double spacing) {
-    int gli;
-    if(c < charMap.size()) {
-        gli = charMap[c];
-        if(gli < 0 || gli >= glyph.size())
-            gli = 0; // 0, by convention, is the unknown glyph
-    } else {
-        gli = 0;
-    }
+typedef struct OutlineData {
+    TtfFont *ttf;
+    float px, py; /* Current point, needed to handle quadratic Beziers. */
+    float dx; /* x offset */
+} OutlineData;
 
-    Glyph *g = &(glyph[gli]);
-    if(!g->pt) return;
+static int move_to(const FT_Vector *p, void *cc)
+{
+    OutlineData *data = (OutlineData *) cc;
+    data->px = p->x / 64.0f;
+    data->py = p->y / 64.0f;
+	return 0;
+}
+
+static int line_to(const FT_Vector *p, void *cc)
+{
+    OutlineData *data = (OutlineData *) cc;
+    data->ttf->LineSegment(data->px + dx, data->py, p->x + dx, p->y);
+    data->px = p->x;
+    data->py = p->y;
+	return 0;
+}
+
+static int conic_to(const FT_Vector *c, const FT_Vector *p, void *cc)
+{
+    OutlineData *data = (OutlineData *) cc;
+	float cx = (c->x / 32.0f), cy = (c->y / 32.0f);
+    float px = p->x / 64.0f, py = p->y / 64.0f;
+	data->ttf->Bezier((p->dx + data->px + cx)/3.0f, (data->py + cy)/3.0f, (p->dx + px + cx)/3.0f, (py + cy)/3.0f, p->dx + px, py);
+    data->px = px;
+    data->py = py;
+	return 0;
+}
+
+static int cubic_to(const FT_Vector *c1, const FT_Vector *c2, const FT_Vector *p, void *cc)
+{
+    OutlineData *data = (OutlineData *) cc;
+	data->ttf->Bezier(c1->x/64.0f, c1->y/64.0f, c2->x/64.0f, c2->y/64.0f, p->x/64.0f, p->y/64.0f);
+    data->px = p->x / 64.0f;
+    data->py = p->y / 64.0f;
+	return 0;
+}
+
+static const FT_Outline_Funcs outline_funcs = {
+	move_to, line_to, conic_to, cubic_to, 0, 0
+};
+
+void TtfFont::PlotCharacter(int *dx, char32_t c, uint32_t gli, float spacing) {
+    OutlineData cc;
+    FT_Fixed advanceWidth = 0;
+	FT_BBox cbox;
+	FT_Matrix m;
+    FT_Vector v;
+    int fterr = 0;
 
     if(c == ' ') {
-        *dx += g->advanceWidth;
+        FT_Get_Advance(font_face, gli, FT_LOAD_NO_SCALE | FT_LOAD_NO_HINTING, &advanceWidth);
+        *dx += advanceWidth;
         return;
     }
+
+    /*
+     * Stupid hacks: if we want fake-bold, use FT_Outline_Embolden(). This actually looks quite good.
+     *               if we want fake-italic, apply a shear transform [1 s s 1 0 0] here.
+     *               this looks decent at small font sizes and bad at larger ones,
+     *               antialiasing mitigates this considerably though.
+     */
+
+	m.xx = m.yx = m.xy = m.yy = 64; /* FIXME: should first of all be 65536, and secondly should actually be scale*65536 */
+	v.x = 0;
+	v.y = 0;
+
+	fterr = FT_Set_Char_Size(font_face, 65536, 65536, 72, 72);
+	if (fterr)
+		dbp("freetype setting character size: %s", ft_error_string(fterr));
+	FT_Set_Transform(font_face, &m, &v);
+
+	fterr = FT_Load_Glyph(font_face, gid, FT_LOAD_NO_BITMAP);
+	if (fterr) {
+		dbp("freetype load glyph (gid %d): %s", gid, ft_error_string(fterr));
+		return NULL;
+	}
 
     int dx0 = *dx;
 
     // A point that has x = xMin should be plotted at (dx0 + lsb); fix up
     // our x-position so that the curve-generating code will put stuff
     // at the right place.
-    *dx = dx0 - g->xMin;
-    *dx += g->leftSideBearing;
+    /* There's no point in getting the glyph BBox here - not only can it be needlessly slow sometimes, but because we're about to render the single glyph,
+     * What we want actually *is* the CBox.
+     *
+     * This is notwithstanding that this makes extremely little sense, this looks like a workaround for either mishandling the start glyph on a line,
+     * or as a really hacky pseudo-track-kerning (in which case it works better than one would expect! especially since most fonts don't set track kerning).
+     */
+	FT_Outline_Get_CBox(&font_face->glyph->outline, &cbox);
+    *dx = dx0 - cbox.xMin / 64.0f;
+    /* Yes, this is what FreeType calls left-side bearing. Then interchangeably uses that with "left-side bearing". Sigh. */
+	*dx += font_face->glyph->metrics.horiBearingX / 64.0f;
 
-    int i;
-    int firstInContour = 0;
-    for(i = 0; i < g->pts; i++) {
-        Handle(dx, g->pt[i].x, g->pt[i].y, g->pt[i].onCurve);
-
-        if(g->pt[i].lastInContour) {
-            int f = firstInContour;
-            Handle(dx, g->pt[f].x, g->pt[f].y, g->pt[f].onCurve);
-            firstInContour = i + 1;
-            Flush();
-        }
+    cc.ttf = this; /* Bleh. */
+    cc.px = x / 64.0f;
+    cc.py = y / 64.0f;
+    cc.dx = *dx / 64.0f;
+	if ((fterr = FT_Outline_Decompose(&font_face->glyph->outline, &outline_funcs, &cc))) {
+		dbp("freetype bezier decomposition failed for gid %d: %s", gid, ft_error_string(fterr));
     }
 
     // And we're done, so advance our position by the requested advance
     // width, plus the user-requested extra advance.
-    *dx = dx0 + g->advanceWidth + (int)(spacing + 0.5);
+	advanceWidth = font_face->glyph->advance / 64.0f;
+#ifndef _MSC_VER
+    *dx = dx0 + advanceWidth + lrintf(spacing);
+#else
+    *dx = dx0 + advanceWidth + (int)(spacing + 0.5f);
+#endif
 }
 
-void TtfFont::PlotString(const char *str, double spacing,
-                         SBezierList *sbl,
+void TtfFont::PlotString(const char *str, float spacing, SBezierList *sbl,
                          Vector porigin, Vector pu, Vector pv)
 {
     beziers = sbl;
@@ -684,29 +336,31 @@ void TtfFont::PlotString(const char *str, double spacing,
 
     int dx = 0;
     while(*str) {
-        char32_t chr;
+        char32_t chr, gid;
         str = ReadUTF8(str, &chr);
-        PlotCharacter(&dx, chr, spacing);
+        gid = FT_Get_Char_Index(ftlib, c);
+        if (gid < 0) {
+            dbp("CID-to-GID mapping for CID 0x%04x failed: %s (using CID as GID)", chr, ft_error_string(gid));
+        }
+        PlotCharacter(&dx, chr, gid, spacing); /* FIXME: chr is only needed to handle spaces, which should be handled outside */
     }
 }
 
-Vector TtfFont::TransformIntPoint(int x, int y) {
+Vector TtfFont::TransformIntPoint(float x, float y) {
     Vector r = origin;
-    r = r.Plus(u.ScaledBy(x / 1024.0));
-    r = r.Plus(v.ScaledBy(y / 1024.0));
+    r = r.Plus(u.ScaledBy(x));
+    r = r.Plus(v.ScaledBy(y));
     return r;
 }
 
-void TtfFont::LineSegment(int x0, int y0, int x1, int y1) {
+void TtfFont::LineSegment(float x0, float y0, float x1, float y1) {
     SBezier sb = SBezier::From(TransformIntPoint(x0, y0),
                                TransformIntPoint(x1, y1));
     beziers->l.Add(&sb);
 }
 
-void TtfFont::Bezier(int x0, int y0, int x1, int y1, int x2, int y2) {
-    SBezier sb = SBezier::From(TransformIntPoint(x0, y0),
-                               TransformIntPoint(x1, y1),
-                               TransformIntPoint(x2, y2));
+void TtfFont::Bezier(float x0, float y0, float x1, float y1, float x2, float y2) {
+    SBezier sb = SBezier::From(TransformIntPoint(x0, y0), TransformIntPoint(x1, y1), TransformIntPoint(x2, y2));
     beziers->l.Add(&sb);
 }
 
