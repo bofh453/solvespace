@@ -300,7 +300,7 @@ typedef IdList<Param,hParam> ParamList;
 #include "sketch.h"
 #include "ui.h"
 #include "expr.h"
-
+#define char32_t int32_t
 
 // Utility functions that are provided in the platform-independent code.
 void ssglLineWidth(GLfloat width);

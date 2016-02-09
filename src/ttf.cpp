@@ -143,7 +143,7 @@ bool TtfFont::LoadFontFromFile(bool nameOnly) {
     }
 
     if (nameOnly) {
-        name = string(font_face->family_name);
+        name = std::string(font_face->family_name);
         FT_Done_Face(font_face);
         free(fontdata);
         return true;
@@ -218,7 +218,7 @@ static int move_to(const FT_Vector *p, void *cc)
 static int line_to(const FT_Vector *p, void *cc)
 {
     OutlineData *data = (OutlineData *) cc;
-    data->ttf->LineSegment(data->px + dx, data->py, p->x + dx, p->y);
+    data->ttf->LineSegment(data->px, data->py, p->x, p->y);
     data->px = p->x;
     data->py = p->y;
 	return 0;
@@ -229,7 +229,7 @@ static int conic_to(const FT_Vector *c, const FT_Vector *p, void *cc)
     OutlineData *data = (OutlineData *) cc;
 	float cx = (c->x / 32.0f), cy = (c->y / 32.0f);
     float px = p->x / 64.0f, py = p->y / 64.0f;
-	data->ttf->Bezier((p->dx + data->px + cx)/3.0f, (data->py + cy)/3.0f, (p->dx + px + cx)/3.0f, (py + cy)/3.0f, p->dx + px, py);
+	data->ttf->Bezier((p->x + data->px + cx)/3.0f, (data->py + cy)/3.0f, (p->x + px + cx)/3.0f, (py + cy)/3.0f, p->x + px, py);
     data->px = px;
     data->py = py;
 	return 0;
@@ -248,12 +248,14 @@ static const FT_Outline_Funcs outline_funcs = {
 	move_to, line_to, conic_to, cubic_to, 0, 0
 };
 
-void TtfFont::PlotCharacter(int *dx, char32_t c, uint32_t gli, float spacing) {
+void TtfFont::PlotCharacter(int *dx, uint32_t c, uint32_t gli, float spacing) {
     OutlineData cc;
     FT_Fixed advanceWidth = 0;
 	FT_BBox cbox;
 	FT_Matrix m;
     FT_Vector v;
+    int scale = font_face->units_per_EM;
+    float invscale = 1.0f/(float)scale;
     int fterr = 0;
 
     if(c == ' ') {
@@ -269,19 +271,22 @@ void TtfFont::PlotCharacter(int *dx, char32_t c, uint32_t gli, float spacing) {
      *               antialiasing mitigates this considerably though.
      */
 
-	m.xx = m.yx = m.xy = m.yy = 64; /* FIXME: should first of all be 65536, and secondly should actually be scale*65536 */
-	v.x = 0;
+    /* init transform matrix to identity */
+	m.xx = m.yy = 1;
+    m.yx = m.xy = 0;
+
+	v.x = *dx;
 	v.y = 0;
 
-	fterr = FT_Set_Char_Size(font_face, 65536, 65536, 72, 72);
+	fterr = FT_Set_Char_Size(font_face, scale, scale, 72, 72);
 	if (fterr)
 		dbp("freetype setting character size: %s", ft_error_string(fterr));
 	FT_Set_Transform(font_face, &m, &v);
 
-	fterr = FT_Load_Glyph(font_face, gid, FT_LOAD_NO_BITMAP);
+	fterr = FT_Load_Glyph(font_face, gli, FT_LOAD_NO_BITMAP | FT_LOAD_IGNORE_TRANSFORM);
 	if (fterr) {
-		dbp("freetype load glyph (gid %d): %s", gid, ft_error_string(fterr));
-		return NULL;
+		dbp("freetype load glyph (gid %d): %s", gli, ft_error_string(fterr));
+		return;
 	}
 
     int dx0 = *dx;
@@ -296,21 +301,21 @@ void TtfFont::PlotCharacter(int *dx, char32_t c, uint32_t gli, float spacing) {
      * or as a really hacky pseudo-track-kerning (in which case it works better than one would expect! especially since most fonts don't set track kerning).
      */
 	FT_Outline_Get_CBox(&font_face->glyph->outline, &cbox);
-    *dx = dx0 - cbox.xMin / 64.0f;
+    *dx = dx0 - cbox.xMin;
     /* Yes, this is what FreeType calls left-side bearing. Then interchangeably uses that with "left-side bearing". Sigh. */
-	*dx += font_face->glyph->metrics.horiBearingX / 64.0f;
+	*dx += font_face->glyph->metrics.horiBearingX;
 
     cc.ttf = this; /* Bleh. */
-    cc.px = x / 64.0f;
-    cc.py = y / 64.0f;
-    cc.dx = *dx / 64.0f;
+    cc.px = *dx;
+    cc.py = 0;
+    cc.dx = *dx;
 	if ((fterr = FT_Outline_Decompose(&font_face->glyph->outline, &outline_funcs, &cc))) {
-		dbp("freetype bezier decomposition failed for gid %d: %s", gid, ft_error_string(fterr));
+		dbp("freetype bezier decomposition failed for gid %d: %s", gli, ft_error_string(fterr));
     }
 
     // And we're done, so advance our position by the requested advance
     // width, plus the user-requested extra advance.
-	advanceWidth = font_face->glyph->advance / 64.0f;
+	advanceWidth = font_face->glyph->advance.x;
 #ifndef _MSC_VER
     *dx = dx0 + advanceWidth + lrintf(spacing);
 #else
@@ -336,9 +341,9 @@ void TtfFont::PlotString(const char *str, float spacing, SBezierList *sbl,
 
     int dx = 0;
     while(*str) {
-        char32_t chr, gid;
-        str = ReadUTF8(str, &chr);
-        gid = FT_Get_Char_Index(ftlib, c);
+        uint32_t chr, gid;
+        str = ReadUTF8(str, (int*)&chr); // why does this return a signed int?
+        gid = FT_Get_Char_Index(font_face, chr);
         if (gid < 0) {
             dbp("CID-to-GID mapping for CID 0x%04x failed: %s (using CID as GID)", chr, ft_error_string(gid));
         }
@@ -346,7 +351,7 @@ void TtfFont::PlotString(const char *str, float spacing, SBezierList *sbl,
     }
 }
 
-Vector TtfFont::TransformIntPoint(float x, float y) {
+Vector TtfFont::TransformFloatPoint(float x, float y) {
     Vector r = origin;
     r = r.Plus(u.ScaledBy(x));
     r = r.Plus(v.ScaledBy(y));
@@ -354,13 +359,13 @@ Vector TtfFont::TransformIntPoint(float x, float y) {
 }
 
 void TtfFont::LineSegment(float x0, float y0, float x1, float y1) {
-    SBezier sb = SBezier::From(TransformIntPoint(x0, y0),
-                               TransformIntPoint(x1, y1));
+    SBezier sb = SBezier::From(TransformFloatPoint(x0, y0),
+                               TransformFloatPoint(x1, y1));
     beziers->l.Add(&sb);
 }
 
 void TtfFont::Bezier(float x0, float y0, float x1, float y1, float x2, float y2) {
-    SBezier sb = SBezier::From(TransformIntPoint(x0, y0), TransformIntPoint(x1, y1), TransformIntPoint(x2, y2));
+    SBezier sb = SBezier::From(TransformFloatPoint(x0, y0), TransformFloatPoint(x1, y1), TransformFloatPoint(x2, y2));
     beziers->l.Add(&sb);
 }
 
